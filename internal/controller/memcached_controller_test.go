@@ -18,67 +18,133 @@ package controller
 
 import (
 	"context"
+	"os"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	cachev1alpha1 "github.com/edutomesco/memcached-operator/api/v1alpha1"
 )
 
-var _ = Describe("Memcached Controller", func() {
-	Context("When reconciling a resource", func() {
-		const resourceName = "test-resource"
+var _ = Describe("Memcached controller", func() {
+	Context("Memcached controller test", func() {
+
+		const MemcachedName = "test-memcached"
 
 		ctx := context.Background()
 
+		namespace := &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      MemcachedName,
+				Namespace: MemcachedName,
+			},
+		}
+
 		typeNamespacedName := types.NamespacedName{
-			Name:      resourceName,
-			Namespace: "default", // TODO(user):Modify as needed
+			Name:      MemcachedName,
+			Namespace: MemcachedName,
 		}
 		memcached := &cachev1alpha1.Memcached{}
 
+		SetDefaultEventuallyTimeout(2 * time.Minute)
+		SetDefaultEventuallyPollingInterval(time.Second)
+
 		BeforeEach(func() {
+			By("Creating the Namespace to perform the tests")
+			err := k8sClient.Create(ctx, namespace)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Setting the Image ENV VAR which stores the Operand image")
+			err = os.Setenv("MEMCACHED_IMAGE", "example.com/image:test")
+			Expect(err).NotTo(HaveOccurred())
+
 			By("creating the custom resource for the Kind Memcached")
-			err := k8sClient.Get(ctx, typeNamespacedName, memcached)
+			err = k8sClient.Get(ctx, typeNamespacedName, memcached)
 			if err != nil && errors.IsNotFound(err) {
-				resource := &cachev1alpha1.Memcached{
+				// Let's mock our custom resource at the same way that we would
+				// apply on the cluster the manifest under config/samples
+				memcached := &cachev1alpha1.Memcached{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:      resourceName,
-						Namespace: "default",
+						Name:      MemcachedName,
+						Namespace: namespace.Name,
 					},
-					// TODO(user): Specify other spec details if needed.
+					Spec: cachev1alpha1.MemcachedSpec{
+						Size:          1,
+						ContainerPort: 11211,
+					},
 				}
-				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+
+				err = k8sClient.Create(ctx, memcached)
+				Expect(err).NotTo(HaveOccurred())
 			}
 		})
 
 		AfterEach(func() {
-			// TODO(user): Cleanup logic after each test, like removing the resource instance.
-			resource := &cachev1alpha1.Memcached{}
-			err := k8sClient.Get(ctx, typeNamespacedName, resource)
+			By("removing the custom resource for the Kind Memcached")
+			found := &cachev1alpha1.Memcached{}
+			err := k8sClient.Get(ctx, typeNamespacedName, found)
 			Expect(err).NotTo(HaveOccurred())
 
-			By("Cleanup the specific resource instance Memcached")
-			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+			Eventually(func(g Gomega) {
+				g.Expect(k8sClient.Delete(context.TODO(), found)).To(Succeed())
+			}).Should(Succeed())
+
+			// TODO(user): Attention if you improve this code by adding other context test you MUST
+			// be aware of the current delete namespace limitations.
+			// More info: https://book.kubebuilder.io/reference/envtest.html#testing-considerations
+			By("Deleting the Namespace to perform the tests")
+			_ = k8sClient.Delete(ctx, namespace)
+
+			By("Removing the Image ENV VAR which stores the Operand image")
+			_ = os.Unsetenv("MEMCACHED_IMAGE")
 		})
-		It("should successfully reconcile the resource", func() {
-			By("Reconciling the created resource")
-			controllerReconciler := &MemcachedReconciler{
+
+		It("should successfully reconcile a custom resource for Memcached", func() {
+			By("Checking if the custom resource was successfully created")
+			Eventually(func(g Gomega) {
+				found := &cachev1alpha1.Memcached{}
+				Expect(k8sClient.Get(ctx, typeNamespacedName, found)).To(Succeed())
+			}).Should(Succeed())
+
+			By("Reconciling the custom resource created")
+			memcachedReconciler := &MemcachedReconciler{
 				Client: k8sClient,
 				Scheme: k8sClient.Scheme(),
 			}
 
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+			_, err := memcachedReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
 			})
 			Expect(err).NotTo(HaveOccurred())
-			// TODO(user): Add more specific assertions depending on your controller's reconciliation logic.
-			// Example: If you expect a certain status condition after reconciliation, verify it here.
+
+			By("Checking if Deployment was successfully created in the reconciliation")
+			Eventually(func(g Gomega) {
+				found := &appsv1.Deployment{}
+				g.Expect(k8sClient.Get(ctx, typeNamespacedName, found)).To(Succeed())
+			}).Should(Succeed())
+
+			By("Reconciling the custom resource again")
+			_, err = memcachedReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Checking the latest Status Condition added to the Memcached instance")
+			Expect(k8sClient.Get(ctx, typeNamespacedName, memcached)).To(Succeed())
+			conditions := []metav1.Condition{}
+			Expect(memcached.Status.Conditions).To(ContainElement(
+				HaveField("Type", Equal(typeAvailableMemcached)), &conditions))
+			Expect(conditions).To(HaveLen(1), "Multiple conditions of type %s", typeAvailableMemcached)
+			Expect(conditions[0].Status).To(Equal(metav1.ConditionTrue), "condition %s", typeAvailableMemcached)
+			Expect(conditions[0].Reason).To(Equal("Reconciling"), "condition %s", typeAvailableMemcached)
 		})
 	})
 })
